@@ -339,6 +339,78 @@ Agent 要执行操作
 | 可以用更便宜的模型做审查（输入少） | 审查跟着任务上下文，成本高 |
 | 审查结果独立审计 | 自己审自己，审计意义打折 |
 
+### 规则引擎（Rule Engine）— Safety Model 的硬编码兜底
+
+当 Safety Model 不可用时（配额用尽、Provider 故障），系统降级为规则引擎。规则引擎是 **硬编码在系统层的操作安全规则**，不依赖 LLM。
+
+**定义**：
+
+| 属性 | 说明 |
+|------|------|
+| **是什么** | 一组编译在 Agent Core 代码中的安全判定函数，不是外部配置文件 |
+| **修改权** | 只有系统开发者可以修改（通过代码提交和版本控制） |
+| **覆盖** | 不可通过 xagent.yaml 覆盖——它是 Safety Model 失效时的最终保险 |
+| **能力** | 可以做"白名单匹配"类的确定性判断，不能做语义级风险评估 |
+
+**规则引擎的判定逻辑**：
+
+```python
+class RuleEngine:
+    """硬编码安全规则，Safety Model 不可用时的兜底"""
+
+    def check(self, operation: ToolCall, context: ContextSnapshot) → Decision:
+        # 规则 1: 白名单路径检查
+        if not self._is_in_project_dir(operation.target_path):
+            return DENY("操作路径超出项目目录")
+
+        # 规则 2: 操作参数安全检查
+        if self._contains_dangerous_pattern(operation.args):
+            return DENY("操作参数包含危险模式")
+
+        # 规则 3: 文件类型检查
+        if operation.action == "write" and self._is_sensitive_file(operation.target_path):
+            return DENY("禁止修改敏感文件")
+
+        # 规则 4: AUTO 级别的确定性规则
+        if operation.permission_level == "auto":
+            return self._check_auto_rules(operation)  # 返回 APPROVE 或 DENY
+
+        # AUTO+ 在规则引擎下无法判断 → 升级
+        if operation.permission_level == "auto_plus":
+            return ESCALATE("Safety Model 不可用，升级人工确认")
+
+    def _is_sensitive_file(self, path: str) → bool:
+        return path in [
+            "xagent.yaml",
+            ".git/config",
+            "secrets/",
+            ".env",
+        ]
+
+    def _contains_dangerous_pattern(self, args: str) → bool:
+        return any(pattern in args for pattern in [
+            "rm -rf /",
+            "> /dev/sda",
+            "mkfs.",
+            "dd if=",
+        ])
+```
+
+**规则引擎 vs Safety Model**：
+
+| | 规则引擎 | Safety Model |
+|---|---------|-------------|
+| **实现** | 硬编码 Python 函数 | LLM 实例 |
+| **判断类型** | 确定性（白名单/黑名单/路径匹配） | 语义级（理解意图和上下文） |
+| **可修改** | 代码提交 → 版本控制 | system prompt 调优 |
+| **适用场景** | 安全兜底，LLM 不可用时 | 正常运行时的安全审查 |
+
+**与 Safety Model 的关系**：
+- 规则引擎是 Safety Model 的**兜底**，不是替代品
+- Safety Model 正常时，规则引擎不参与决策
+- Safety Model 配额用尽或故障时，规则引擎接管（详见 Section 15 配额降级链）
+- 规则引擎的判断比 Safety Model 更保守（宁可误拒，不能漏放）
+
 ### 第三层：沙箱隔离（Sandbox Isolation）
 
 - **文件系统**：Agent 只能读写项目目录 + 显式白名单
@@ -568,8 +640,8 @@ Contact:
 
 | 阶段 | 内容 |
 |-------|---------|
-| **Phase A（初期）** | 角色、权限、关注领域、profile_text（静态） |
-| **Phase C（远期）** | AI 自动学习：近期关注点、决策偏好、协作模式、活跃时段、交互统计 |
+| **Phase 1（初期）** | 角色、权限、关注领域、profile_text（静态，手动维护） |
+| **Phase 2（远期）** | AI 自动学习：近期关注点、决策偏好、协作模式、活跃时段、交互统计 |
 
 ### 用途
 
@@ -997,7 +1069,40 @@ REJECT 操作 → 不受影响（本来就不走任何审查）
 ```
 
 此设计确保 Safety Model 配额超限时，系统自动变严格（而非变宽松），安全性不降级。
+
+**配额降级的"高峰积压"风险与缓解**：
+
+Safety Model 配额用尽后，所有 AUTO+ 操作升级为 CONFIRM，在活跃开发时段可能导致人工确认队列膨胀，实际上卡死 Agent 的执行节奏。
+
+缓解策略（按优先级排列）：
+
+| 策略 | 机制 | 效果 |
+|------|------|------|
+| **Per-Feature 配额** | Feature 级别独立配额（如每 Feature 50 次），而不是全局共用 | 单个大 Feature 不会耗尽其他 Feature 的配额 |
+| **滚动窗口** | 将每日配额改为每小时配额（hourly limit），用完等下一个小时 | 避免"上午用完下午全人工"的局面 |
+| **自动续期** | 配额用尽后，短时间自动续期（如每 10 分钟自动增加 5 次额度） | 平滑配额消耗曲线，避免长时间完全不可用 |
+| **降级白名单** | 低风险 AUTO+ 操作在规则引擎下也能通过（如测试运行、lint 检查） | 减少升级量，只让真正需要判断的升级 |
+| **优先级队列** | 升级的 CONFIRM 请求按 risk_level 排序，低风险的操作不抢占人工注意力 | 人不会被打断去确认"跑个测试" |
+
+```yaml
+# xagent.yaml — Safety Model 配额细化配置
+cost:
+  safety_model_quota:
+    per_hour: 5             # 每小时 5 次（替代 per_day 50）
+    per_feature: 50         # 每 Feature 50 次
+    auto_renew: 2           # 配额用尽后每 10 分钟自动续 2 次
+
+    # 降级白名单：即使 Safety Model / 规则引擎不可用，这些操作也不升级人工
+    degrade_allowlist:
+      - tool: "test_run"
+      - tool: "lsp_query"
+      - tool: "git_status"
+      - tool: "git_diff"
 ```
+
+**设计立场**：
+
+> Safety Model 配额设计的目标是"鼓励高效使用"而非"限制功能"。配额用尽不应成为团队的日常体验。如果活跃项目频繁触发配额，应该调整配额上限，而不是接受人工确认堆积。降级链是为了确保"万一发生时安全"，不是为了在正常运行中触发。
 
 ### 策略二：Context 瘦身 — 不喂多余的东西
 
