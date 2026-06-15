@@ -1,138 +1,139 @@
-# xagent — AI-Native Software Engineering Collaboration Platform
+# xagent — AI 原生的软件工程协作平台
 
-> **Design Document** | 2026-06-14 | Version 1.0
-
----
-
-## Overview
-
-xagent is an AI-native software engineering platform where an AI agent serves as the primary developer, while human team members interact through IM channels (企业微信/钉钉/飞书). The platform supports a small team (2-5 people + AI) collaborating on a single project.
-
-### Core Principles
-
-- **AI is the main worker** — the agent owns execution end-to-end
-- **IM is the primary interface** — all human interaction flows through familiar chat tools
-- **Full visibility** — every team member can inspect any part of the project at any time
-- **Safety by default** — all agent actions are permission-gated, audited, and reversible
-- **Context-bound decisions** — every confirmation is scoped to a specific context snapshot
+> **设计文档** | 2026-06-14 | Version 1.0
 
 ---
 
-## Section 1: Architecture Overview
+## 概述
 
-### Three-Layer Architecture
+xagent 是一个 AI 原生的软件工程平台。AI Agent 是主力开发者，人类团队成员通过 IM 渠道（企业微信/钉钉/飞书）与 Agent 交互。平台支持小团队（2-5 人 + AI）围绕单个项目协作。
+
+### 核心原则
+
+- **AI 是主力干活的** — Agent 端到端负责执行
+- **IM 是主要交互界面** — 所有人通过熟悉的聊天工具与 Agent 沟通
+- **全员可见** — 任何团队成员可以随时查看项目的任何部分
+- **默认安全** — Agent 的所有操作都经过权限门禁、审计追踪、可回滚
+- **上下文绑定决策** — 每次确认都限定在特定的上下文快照范围内
+
+---
+
+## Section 1: 整体架构
+
+### 三层架构
 
 ```
 Channel Layer  →  Agent Core  →  Project Brain
-   (I/O)           (Think+Act)      (Memory)
+   (I/O 层)       (思考+执行)     (记忆存储)
 ```
 
-| Layer | Responsibility | Principle |
+| 层 | 职责 | 原则 |
 |-------|---------------|-----------|
-| **Channel Layer** | Translate between IM protocols and internal events | Pure I/O, no business logic |
-| **Agent Core** | Message routing, task decomposition, LLM orchestration, tool execution | Central brain, owns all decisions |
-| **Project Brain** | Persistent storage of all state, decisions, changes, contacts | Single source of truth |
+| **Channel Layer（渠道层）** | IM 协议与内部事件之间的翻译转换 | 纯 I/O，不含业务逻辑 |
+| **Agent Core（智能体核心）** | 消息路由、任务拆解、LLM 编排、工具执行 | 中央大脑，拥有所有决策权 |
+| **Project Brain（项目大脑）** | 所有状态、决策、变更、联系人的持久化存储 | 唯一真相源 |
 
-### Component Diagram
+### 组件架构图
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                CHANNEL LAYER                      │
+│                  CHANNEL LAYER                     │
 │  企业微信 Adapter  │  钉钉 Adapter  │  飞书 Adapter  │  Web Dashboard │
 └───────────────────────┬─────────────────────────┘
                         │  Channel Events
                         ▼
 ┌─────────────────────────────────────────────────┐
-│                AGENT CORE                         │
-│  Message Router  │  Task Orchestrator             │
-│  Decision Escalator  │  LLM Engine  │  Tool Harness │
+│                  AGENT CORE                       │
+│  Message Router（消息路由）│  Task Orchestrator（任务编排）│
+│  Decision Escalator（决策升级）│  LLM Engine │  Tool Harness │
 └───────────────────────┬─────────────────────────┘
                         │
                         ▼
 ┌─────────────────────────────────────────────────┐
-│              PROJECT BRAIN                        │
-│  Task Graph  │  Decision Log  │  Code History     │
-│  Contact Store  │  Discussion Threads             │
+│                PROJECT BRAIN                      │
+│  Task Graph（任务图）│  Decision Log（决策日志）    │
+│  Code History（变更历史）│  Contact Store（联系人）  │
+│  Discussion Threads（讨论线程）                    │
 │  ─────────────────────────────────────            │
-│  Event Store (append-only, immutable)            │
+│  Event Store（append-only，不可变）                │
 └─────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Section 2: Agent Core
+## Section 2: Agent Core（智能体核心）
 
-### Agent Lifecycle
+### Agent 生命周期
 
-- **Singleton per project** — one agent instance per project
-- **Full state persistence** — all agent state (task tree, conversation context, pending tool calls, active discussions) persisted to Project Brain
-- **Periodic checkpointing** — agent snapshots state at regular intervals
-- **Failover** — watchdog detects crash, restores from latest checkpoint, replays Event Store events since checkpoint, notifies team via IM
+- **单例模式** — 每个项目一个 Agent 实例
+- **全量状态持久化** — Agent 的所有状态（任务树、对话上下文、未完成的工具调用、进行中的讨论）都持久化到 Project Brain
+- **定期 checkpoint** — Agent 定期快照状态
+- **故障恢复（Failover）** — Watchdog 检测到崩溃后，从最新 checkpoint 恢复，重放 checkpoint 之后的 Event Store 事件，恢复未完成任务和进行中的讨论，并通过 IM 通知团队
 
-### Message Processing Pipeline
-
-```
-IM Message → Identity Resolve → Intent Parse → (Query/Execute)
-                                                   │
-                                          Task Decompose
-                                                   │
-                                          Confidence Check
-                                        ┌────┼────┐
-                                    SAFE │ UNCERTAIN
-                                        │    │
-                                   Execute  Escalate to Human
-                                        │    (Discussion Thread)
-                                   Broadcast
-```
-
-### Decision Escalation — Discussion Threads
-
-When the agent is uncertain, it creates a **Discussion Thread** in the IM channel:
-
-1. **Create thread** with question description, context, and optional deadline
-2. **Select participants** — AI decides who to involve based on: code ownership, role, focus areas in contact profile
-3. **Track discussion** — monitor who said what, detect conflicts
-4. **Conflict types detected**:
-   - Opinion conflict: A says X, B says Y
-   - Temporal conflict: B's response based on stale context
-   - Silence conflict: key person hasn't responded
-5. **Resolution**:
-   - Consensus → record decision, execute
-   - Cannot reach consensus → escalate to higher authority
-   - Timeout → AI judges safety, may proceed with default strategy
-
-### Thread State Model
+### 消息处理流水线
 
 ```
-OPEN → CONFLICT → STALLED → RESOLVED
-                   │          │
-                   ▼          ▼
-               ESCALATED    CLOSED
+IM 消息进入 → 身份识别 → 意图解析 → （查询类/执行类）
+                                        │
+                                   任务拆解
+                                        │
+                                   信心检查
+                                 ┌────┼────┐
+                            确定  │        │ 不确定
+                                 │        │
+                            直接执行   升级为人工确认
+                                 │     （Discussion Thread）
+                            广播通知
+```
+
+### 决策升级 — Discussion Thread（讨论线程）
+
+当 Agent 不确定时，在 IM 渠道中创建 **Discussion Thread**：
+
+1. **创建线程** — 附带问题描述、上下文和可选的截止时间
+2. **选择参与者** — AI 根据代码归属、角色、联系人 profile 中的关注领域来决定拉谁进来
+3. **追踪讨论** — 监控每个人说了什么，检测冲突
+4. **三种冲突检测**：
+   - 观点冲突：A 说 X，B 说 Y
+   - 时空冲突：B 的回复基于过时的上下文
+   - 沉默冲突：关键人物未回复
+5. **决议闭环**：
+   - 达成共识 → 记录决策，执行
+   - 无法共识 → 提级到更高决策权的人
+   - 超时未决 → AI 判断安全性，可能按默认策略推进
+
+### 线程状态模型
+
+```
+OPEN（开放）→ CONFLICT（冲突中）→ STALLED（停滞）→ RESOLVED（已解决）
+                    │                  │
+                    ▼                  ▼
+              ESCALATED（已提级）   CLOSED（已关闭）
 ```
 
 ---
 
-## Section 3: Fine-Grained Task Decomposition
+## Section 3: 细粒度任务拆解
 
-### Task Hierarchy
+### 任务层级
 
 ```
-Epic (user request)
- └─ Feature (logical unit)
-     └─ Atomic Task (single action)
+Epic（用户需求）
+ └─ Feature（逻辑单元）
+     └─ Atomic Task（原子任务，单次操作）
 ```
 
-### Atomic Task Criteria
+### 原子任务的 5 条标准
 
-| Criterion | Description |
+| 标准 | 说明 |
 |-----------|-------------|
-| **Single file** | One task touches one file (or one clear small scope) |
-| **Single action** | "Create file" OR "Modify function" OR "Add test" |
-| **Verifiable** | Clear success criteria (test passes, lint passes) |
-| **Reversible** | Failure doesn't affect other tasks |
-| **≤ 5 minutes** | Ideal execution time per atomic task |
+| **单文件** | 一个任务只动一个文件（或一个明确的小范围） |
+| **单动作** | "创建文件" 或 "修改函数" 或 "添加测试"，不混 |
+| **可验证** | 有明确的成功标准（测试通过、lint 过） |
+| **可回滚** | 失败不影响其他任务，可独立回滚 |
+| **≤ 5 分钟** | 理想情况下单个原子任务执行时间不超过 5 分钟 |
 
-### Task Data Model
+### 任务数据模型
 
 ```yaml
 Task:
@@ -147,67 +148,67 @@ Task:
   visible_to: all
 ```
 
-### Parallel Execution
+### 并行执行策略
 
-- Features can run in parallel
-- Within a feature, tasks follow dependency order
-- Max 5 concurrent sub-agents (to avoid LLM rate limits)
-- Agent analyzes dependency graph to maximize parallelism
+- Feature 之间可以并行
+- Feature 内部按依赖关系串行
+- 最多 5 个 sub-agent 并发（避免 LLM rate limit）
+- Agent 自动分析依赖图以最大化并行度
 
 ---
 
-## Section 4: Harness Security — 4-Layer Model
+## Section 4: Harness 安全 — 四层模型
 
-### Layer 1: Capability Boundary
-Agent can only call registered tools. Unregistered capabilities don't exist.
+### 第一层：能力边界（Capability Boundary）
+Agent 只能调用已注册的工具。未注册的能力根本不存在。
 
-**Default tools**: `file_read`, `file_write`, `shell_exec`, `git_*`, `web_fetch`, `lsp_query`
-**Plugins**: `browser`, `db_query`, `docker`, …
-**Hard-forbidden**: `file_delete` (default), `network_bind`, `sudo`
+**默认工具**：`file_read`、`file_write`、`shell_exec`、`git_*`、`web_fetch`、`lsp_query`
+**可插件扩展**：`browser`、`db_query`、`docker`、…
+**硬编码禁止**：`file_delete`（默认）、`network_bind`、`sudo`
 
-### Layer 2: Permission Gate
+### 第二层：权限门禁（Permission Gate）
 
-| Level | Behavior | Example |
+| 级别 | 行为 | 示例 |
 |-------|----------|---------|
-| 🟢 **AUTO** | Execute, log after | file_read, git log, test_run |
-| 🟡 **AI_REVIEW** | AI self-checks first; if safe → auto; if uncertain → escalate | file_write, shell_exec, git_commit |
-| 🔴 **CONFIRM** | Always ask human | pip_install, config_change |
-| ⛔ **REJECT** | Hard-coded deny, cannot override | file_delete, git_push --force |
+| 🟢 **AUTO（自动）** | 直接执行，事后记录 | file_read、git log、test_run |
+| 🟡 **AI_REVIEW（AI 自查）** | AI 先自检；安全则自动；不确定则升级 | file_write、shell_exec、git_commit |
+| 🔴 **CONFIRM（人工确认）** | 必须问人 | pip_install、config_change |
+| ⛔ **REJECT（硬禁止）** | 硬编码拒绝，不可绕过 | file_delete、git_push --force |
 
-### Layer 3: Sandbox Isolation
+### 第三层：沙箱隔离（Sandbox Isolation）
 
-- **FS**: Agent can only read/write project directory + explicit allowlist
-- **Network**: Domain allowlist (pypi.org, github.com, …)
-- **Process**: ulimit, no fork bombs
-- **Time**: Single shell command max 5 minutes
-- **Implementation**: Docker container (production), subprocess + chroot + seccomp (initial)
+- **文件系统**：Agent 只能读写项目目录 + 显式白名单
+- **网络**：域名白名单（pypi.org、github.com、…）
+- **进程**：ulimit 限制，禁止 fork bomb
+- **时间**：单次 shell 命令最长 5 分钟
+- **实现方案**：生产环境用 Docker 容器，初期用 subprocess + chroot + seccomp
 
-### Layer 4: Audit Trail
+### 第四层：审计追踪（Audit Trail）
 
-Every tool call logged to Event Store:
+每次工具调用记录到 Event Store：
 ```yaml
 {tool, input, output, duration, permission_level,
  auto_approved, sandbox_id, files_touched, snapshot_diff}
 ```
 
-### Rollback Mechanism
+### 回滚机制
 
-- **Git-level** (coarse): auto-stash before feature, reset if needed
-- **Overlay-level** (fine): per-task overlay delta; discard on failure without affecting parallel tasks
-- **Triggers**: agent self-detected failure, Dashboard click, IM command
+- **Git 级（粗粒度）**：Feature 开始前自动 git stash，需要时 reset
+- **Overlay 级（细粒度）**：每个原子任务的 overlay delta；失败时丢弃该 delta，不影响并行的其他任务
+- **触发方式**：Agent 自检发现失败、Dashboard 点击、IM 命令
 
 ---
 
-## Section 5: Multi-Channel Confirmation & Decision Records
+## Section 5: 多渠道确认 & 决策记录
 
-### Confirmation Flow
+### 确认流程
 
-1. Agent needs confirmation → generates Confirmation Request with context snapshot
-2. Dispatches to **all channels simultaneously** (IM DM + group @mention + Dashboard)
-3. First response from any channel takes effect
-4. Timeout (30 min) → AI judges whether to proceed or escalate
+1. Agent 需要确认 → 生成附带上下文快照的 Confirmation Request
+2. **同时推送到所有渠道**（IM 私聊 + 群 @提醒 + Dashboard 通知）
+3. 任一渠道先回复即生效
+4. 超时（30 分钟）→ AI 判断是否继续推进或升级
 
-### Decision Record (Immutable)
+### Decision Record（决策记录 — 不可变）
 
 ```yaml
 DecisionRecord:
@@ -219,68 +220,68 @@ DecisionRecord:
   decision: [approved|rejected|expired]
   decided_at, comment
   hash: sha256(entire_record)
-  prev_hash: sha256(previous_record)  # chain for tamper-proofing
+  prev_hash: sha256(previous_record)  # hash 链式关联，防篡改
 ```
 
-### Decision Log Queries
+### Decision Log 查询能力
 
-- "Who approved changes to this file?" → filter by file
-- "What decisions did 张三 make recently?" → aggregate by decided_by
-- "Which confirmations timed out?" → filter by expired
-- "What was discussed for Feature X?" → join with discussion threads
+- "这个文件谁同意改的？" → 按文件过滤
+- "张三最近做了哪些决策？" → 按 decided_by 聚合
+- "哪些确认被超时忽略了？" → 按 expired 过滤
+- "Feature X 讨论了什么？" → 与 Discussion Thread 关联查询
 
 ---
 
-## Section 6: Context Binding & Smart Timeout
+## Section 6: 上下文绑定 & 智能超时
 
-### Context Binding Principle
+### 上下文绑定原则
 
-> A confirmation means "you may execute THIS specific operation in THIS specific context." If the context changes, authorization is void.
+> 确认的意思是"在这个具体的上下文下，你可以执行这个具体的操作"。上下文一变，授权自动失效。
 
-Before executing any confirmed action, the agent checks:
+执行任何已确认的操作前，Agent 强制检查：
 
-| Check | Mismatch Behavior |
+| 检查项 | 不匹配时的行为 |
 |-------|-------------------|
-| File content hash unchanged? | Re-confirm (someone else modified the file) |
-| Dependent tasks still satisfied? | Re-confirm (preconditions changed) |
-| Branch unchanged? | Re-confirm (wrong branch) |
-| Permission config unchanged? | Re-confirm (rules changed) |
-| Decision-maker still valid? | Re-route (person left/changed role) |
+| 文件内容 hash 是否一致？ | 重新确认（文件被别人改了） |
+| 依赖任务是否仍满足？ | 重新确认（前置条件变了） |
+| 分支是否一致？ | 重新确认（可能在错误分支） |
+| 权限配置是否变更？ | 重新确认（规则变了） |
+| 决策者是否仍有效？ | 重新路由（人可能离职/换岗） |
 
-### Smart Timeout
+### 智能超时
 
-Instead of auto-reject on timeout:
-1. AI judges: is the context still clean? Is the risk low?
-2. Clean context + low risk → AI confirms and proceeds (logged)
-3. Context changed → regenerate confirmation request
-4. High risk or uncertain → @remind + reset TTL
+超时不等于粗暴拒绝，而是走 AI 判断：
+1. AI 判断：上下文还干净吗？风险低吗？
+2. 上下文干净 + 低风险 → AI 确认继续（记录在案）
+3. 上下文变了 → 重新生成确认请求
+4. 高风险或不确定 → @提醒 + 重置 TTL
 
-Applies equally to AI_REVIEW and CONFIRM levels.
+此机制对 AI_REVIEW 和 CONFIRM 级别同等适用。
 
 ---
 
-## Section 7: Project Brain — Data Model
+## Section 7: Project Brain（项目大脑）— 数据模型
 
-### Architecture
+### 架构
 
 ```
-Task Graph  │  Decision Log  │  Code History  │  Contact Store
-     └────────────┴───────────────┴───────────────┘
-                        │
-                        ▼
-              Event Store (append-only, immutable)
+Task Graph（任务图）│  Decision Log（决策日志）│  Code History（变更历史）│  Contact Store（联系人）
+              └────────────┴───────────────┴───────────────┘
+                                  │
+                                  ▼
+                      Event Store（append-only, 不可变）
 ```
 
-### Core Entities
+### 四大核心实体
 
-| Entity | Key Fields | Typical Queries |
+| 实体 | 关键字段 | 典型查询 |
 |--------|-----------|-----------------|
-| **Task** | id, parent_id, type, status, depends_on, tool_calls[], decisions[] | "What's in progress?", "What blocks task_042?" |
-| **Decision** | id, type, context_snapshot, decided_by, channel, hash | "Who approved this?", "Recent rejections?" |
-| **Change** | id, type, file_path, diff_hash, tool, task_id | "History of auth.py", "What changed in last 24h?" |
-| **Contact** | id, name, im_accounts[], role, permissions, focus_areas[], profile_text | "Who owns this module?", "张三's focus areas?" |
+| **Task** | id, parent_id, type, status, depends_on, tool_calls[], decisions[] | "现在有哪些任务在进行？"、"task_042 被什么阻塞了？" |
+| **Decision** | id, type, context_snapshot, decided_by, channel, hash | "谁批准了这个？"、"最近的拒绝记录？" |
+| **Change** | id, type, file_path, diff_hash, tool, task_id | "auth.py 的改动历史"、"最近 24h 改了哪些文件？" |
+| **Contact** | id, name, im_accounts[], role, permissions, focus_areas[], profile_text | "这个模块该找谁？"、"张三关注哪些领域？" |
 
-### Discussion Thread Entity
+### Discussion Thread 实体
 
 ```yaml
 DiscussionThread:
@@ -289,65 +290,65 @@ DiscussionThread:
   messages: [{from, content, at}]
   conflict_events: [{type, between, topic, at}]
   resolution: {type, final_choice, reason}
-  → DecisionRecord (resolution recorded as Decision)
+  → DecisionRecord（决议落地为 Decision）
 ```
 
-### Storage
+### 存储方案
 
-| Layer | Technology | Notes |
+| 层 | 技术 | 说明 |
 |-------|-----------|-------|
-| Event Store | SQLite (init) / PostgreSQL (prod) | Append-only table, timestamp-indexed |
-| Materialized Views | Same DB views / in-memory cache | Real-time projections of Event Store |
-| File Storage | Local FS + Git | Git provides version history natively |
-| Vector Store (future) | Pinecone / pgvector | Semantic search over history |
+| Event Store | SQLite（初期）/ PostgreSQL（生产） | append-only 表，时间戳索引 |
+| 物化视图 | 同库 view / 内存缓存 | Event Store 的实时投影 |
+| 文件存储 | 本地 FS + Git | Git 天然提供版本历史 |
+| 向量存储（未来）| Pinecone / pgvector | 历史语义搜索 |
 
 ---
 
-## Section 8: Dashboard — Project Living Map
+## Section 8: Dashboard（项目活地图）
 
-### Layout
+### 布局
 
 ```
 ┌────────────────────────────────────────────┐
-│  xagent / my-project        🔔 3 pending   │
+│  xagent / my-project        🔔 3 条待确认  │
 ├────────────────────────────────────────────┤
-│  📊 Task Progress    │  🤖 Agent Status    │
-│  ████████░░ 18/22   │  Executing task_044 │
-│  User Login 82%     │  3 sub-agents active │
+│  📊 任务进度            │  🤖 Agent 状态    │
+│  ████████░░ 18/22      │  正在执行 task_044│
+│  用户登录功能 82%       │  3 个子 Agent 运行 │
 ├────────────────────────────────────────────┤
-│  ⚡ Live Feed                              │
-│  14:32 ✅ task_042 completed               │
-│  14:31 🤖 AI self-review passed            │
-│  14:28 📝 task_045 started                 │
+│  ⚡ 实时动态                               │
+│  14:32 ✅ task_042 已完成 创建 User 表迁移  │
+│  14:31 🤖 AI 自检通过   git commit auth 模块│
+│  14:28 📝 task_045 开始 实现登录逻辑        │
 ├─────────────────────┬──────────────────────┤
-│  🔑 Pending (3)     │  💬 Discussions (1)  │
-│  pip install bcrypt │  "Redis or MySQL?"   │
-│  [Approve] [Reject] │  [View Thread]       │
+│  🔑 待确认 (3)       │  💬 讨论中 (1)      │
+│  pip install bcrypt │  "Redis 还是 MySQL？"│
+│  [确认] [拒绝]       │  [查看讨论]         │
 └─────────────────────┴──────────────────────┘
 ```
 
-### Pages
+### 页面结构
 
-| Page | Content |
+| 页面 | 内容 |
 |------|---------|
-| **Overview** | Task progress + Agent status + Live feed + Pending list |
-| **Task Map** | Task tree visualization, dependency graph |
-| **Decision Log** | All Decision Records, filterable, hash chain verifiable |
-| **Code Changes** | File change history, diffs, linked tasks/decisions |
-| **Discussions** | All threads by status (active/resolved/escalated) |
-| **Contacts** | Team list, profiles, activity stats |
+| **总览** | 任务进度 + Agent 状态 + 实时动态流 + 待确认列表 |
+| **任务地图** | 任务树可视化、依赖关系图，点击查看详情和代码变更 |
+| **决策日志** | 所有 Decision Record，可按时间/人/类型筛选，hash 链可验证 |
+| **代码变更** | 文件变更历史，每次改动的 diff，关联的任务和决策 |
+| **讨论区** | 所有 Discussion Thread，按状态筛选（进行中/已解决/已提级） |
+| **联系人** | 团队人员列表，profile、活跃度、历史决策统计 |
 
-### Tech Stack
+### 技术选型
 
-- **Frontend**: React + Tailwind (lightweight SPA)
-- **Real-time**: WebSocket (Event Store changes pushed to frontend)
-- **Data**: REST API reading from Project Brain views
+- **前端**：React + Tailwind（轻量 SPA）
+- **实时更新**：WebSocket（Event Store 变更推送到前端）
+- **数据**：REST API 从 Project Brain 视图读取
 
 ---
 
-## Section 9: Contact System
+## Section 9: Contact System（联系人系统）
 
-### Profile Model
+### Profile 模型
 
 ```yaml
 Contact:
@@ -357,74 +358,74 @@ Contact:
   profile_text: "自然语言描述，类 claude.md 格式"
 ```
 
-### Profile Evolution
+### Profile 演进路径
 
-| Phase | Content |
+| 阶段 | 内容 |
 |-------|---------|
-| **Phase A (initial)** | Role, permissions, focus areas, profile text (static) |
-| **Phase C (future)** | AI-learned: recent focus, decision preferences, collaboration patterns, active hours, interaction stats |
+| **Phase A（初期）** | 角色、权限、关注领域、profile_text（静态） |
+| **Phase C（远期）** | AI 自动学习：近期关注点、决策偏好、协作模式、活跃时段、交互统计 |
 
-### Usage
+### 用途
 
-- Agent reads profile to decide escalation targets
-- profile_text provides communication style guidance
-- Interaction history builds up over time for context-aware routing
+- Agent 读取 profile 决定升级目标
+- profile_text 提供沟通风格参考
+- 交互历史持续积累，支撑上下文感知路由
 
 ---
 
-## Section 10: IM Channel
+## Section 10: IM Channel（IM 渠道）
 
-### Adapter Interface
+### Adapter 接口
 
 ```python
 class IMAdapter:
     platform: "wecom" | "dingtalk" | "feishu"
 
-    # Inbound: IM → Agent
+    # 入站：IM → Agent
     def on_message(msg) → ChannelEvent:
-        # Normalizes to: from_contact, channel_type, content, mentions, reply_to
+        # 标准化为：from_contact, channel_type, content, mentions, reply_to
 
-    # Outbound: Agent → IM
+    # 出站：Agent → IM
     def send_message(target, formatted_msg)
     def send_confirmation(target, confirm_request)
     def create_discussion_thread(group, question)
 ```
 
-### Message Routing
+### 消息路由规则
 
-| Message Type | Delivery |
+| 消息类型 | 送达方式 |
 |-------------|----------|
-| Progress notification | Project group (visible to all) |
-| Confirmation request | DM + group @mention + Dashboard |
-| Discussion initiation | Group thread, @required participants |
-| Query response | Reply to source channel |
-| Error/exception | Group broadcast + DM tech lead |
+| 进度通知 | 项目群（所有人可见） |
+| 确认请求 | 私聊 + 群 @提醒 + Dashboard |
+| 讨论发起 | 群内 thread，@必选参与者 |
+| 查询响应 | 回复到消息来源渠道 |
+| 错误/异常 | 群内广播 + 私聊技术负责人 |
 
-### Initial Platform
+### 初始平台
 
-Start with 企业微信 (WeCom). Architecture supports adding 钉钉, 飞书 later.
+从企业微信开始。架构预留了钉钉、飞书等后续平台的扩展空间。
 
 ---
 
-## Section 11: LLM Engine — Multi-Model Capability Abstraction
+## Section 11: LLM Engine — 多模型能力抽象
 
-### Architecture
+### 架构
 
 ```
-Agent Request → Model Router → Provider Adapter → Model API
-                      │
-              Capability Registry
+Agent Request → Model Router（模型路由）→ Provider Adapter（适配器）→ Model API
+                         │
+                 Capability Registry（能力注册中心）
 ```
 
-### Three-Tier Model
+### 三级 Tier 模型
 
-| Tier | Role | Required Capabilities | Example Tasks |
+| Tier | 角色 | 所需能力 | 典型任务 |
 |------|------|----------------------|---------------|
-| **BRAIN** | Reasoning & decisions | reasoning ✓, tool_use ✓, large context | Task decomposition, architecture, conflict resolution |
-| **WORKER** | Code generation & execution | code ✓, tool_use ✓, medium context | Code gen, code review, test gen, docs |
-| **FAST** | Simple queries | text ✓, small context | Intent parsing, message summary, status checks |
+| **BRAIN（大脑）** | 推理与决策 | reasoning ✓, tool_use ✓, 大上下文 | 任务拆解、架构决策、冲突调解 |
+| **WORKER（主力）** | 代码生成与执行 | code ✓, tool_use ✓, 中等上下文 | 代码生成、代码审查、测试生成、文档 |
+| **FAST（轻量）** | 简单查询 | text ✓, 小上下文 | 意图识别、消息摘要、状态检查 |
 
-### Capability Profile
+### Capability Profile（能力档案）
 
 ```yaml
 ModelCapability:
@@ -440,62 +441,63 @@ ModelCapability:
     compression: [summarize|truncate|hybrid]
 ```
 
-### Vision Fallback Strategies
+### Vision 能力降级策略
 
-When a model lacks vision capability:
-1. **Re-route** (default): temporarily switch to a vision-capable model for that call
-2. **Pre-process**: call vision model to describe image, feed text to non-vision model
-3. **Degrade**: skip image, use text-only context
+当模型缺少 vision（图像处理）能力时：
 
-### Capability Fallback
+1. **Re-route（切换模型，默认策略）**：临时切换到有 vision 能力的模型处理该次调用
+2. **Pre-process（预处理）**：先让 vision 模型描述图片，将文字描述喂给非 vision 模型
+3. **Degrade（退化）**：跳过图片，只用文字上下文
 
-| Missing Capability | Strategy |
+### 能力不足时的 fallback 策略
+
+| 缺少的能力 | 应对策略 |
 |-------------------|----------|
-| vision | re_route |
-| tool_use | error (can't work) |
-| reasoning | degrade to lower tier |
+| vision（图像处理）| re_route（切换模型） |
+| tool_use（工具调用）| error（无法工作，报错） |
+| reasoning（推理能力）| degrade（降级到上层 Tier） |
 
 ---
 
-## Section 12: Context Manager
+## Section 12: Context Manager（上下文管理器）
 
-### Router + Context Manager Coordination
+### Router 与 Context Manager 协同
 
 ```
-Router selects model → Context Manager builds request for that model
+Router 选模型 → Context Manager 为该模型构建请求
 ```
 
-The Router owns "which model", the Context Manager owns "what to feed it."
+Router 管"用谁"，Context Manager 管"喂什么"。
 
-### Context Profile (per model)
+### Context Profile（每个模型的上下文配置）
 
-Each model declares in its Capability Profile:
-- `max_tokens`, `effective_tokens` (reserving space for output)
-- Cache mechanism, TTL, breakpoint count
-- Preferred compression strategy
-- Message format overhead estimate
+每个模型在其 Capability Profile 中声明：
+- `max_tokens`、`effective_tokens`（给输出预留空间）
+- 缓存机制、TTL、breakpoint 数量
+- 首选压缩策略
+- 消息格式开销估算
 
-### Layered Compression
+### 分层压缩策略
 
-When context exceeds model limit:
+当上下文超过模型限制时：
 
-| Layer | Strategy | Savings |
+| 层级 | 策略 | 节省空间 |
 |-------|----------|---------|
-| L1 | Trim irrelevant messages (completed tool results, intermediate queries) | ~30% |
-| L2 | Summarize history via FAST Tier model | ~80% |
-| L3 | Truncate long outputs (shell results, diffs) | ~20% |
-| L4 | Split task into smaller sub-tasks (emergency) | Variable |
+| L1 | 裁剪无关消息（已完成的工具调用结果、中间问询） | ~30% |
+| L2 | 通过 FAST Tier 模型生成对话摘要 | ~80% |
+| L3 | 截断长输出（shell 结果、大型 diff） | ~20% |
+| L4 | 拆分成更小的子任务（紧急降级） | 不定 |
 
-### Context Bridge (Cross-Model)
+### Context Bridge（跨模型上下文桥接）
 
-When the Router switches models mid-session (e.g., DeepSeek → Claude for vision):
+当 Router 在会话中途切换模型时（如 DeepSeek → Claude 处理图片）：
 
-1. Compress full conversation history into a summary (using FAST Tier model)
-2. Pass summary + current task context + new input to target model
-3. Target model gets: system prompt + condensed history + task state + current request
-4. NOT the full 47-message conversation
+1. 将完整对话历史通过 FAST Tier 模型压缩成摘要
+2. 将摘要 + 当前任务上下文 + 新输入传给目标模型
+3. 目标模型收到的是：system prompt + 压缩历史 + 任务状态 + 当前请求
+4. 不是 47 轮原始对话
 
-### Core Interface
+### 核心接口
 
 ```python
 class ContextManager:
@@ -507,42 +509,42 @@ class ContextManager:
 
 ---
 
-## Security Summary
+## 安全总览
 
-| Concern | Mechanism |
+| 安全关切 | 保障机制 |
 |---------|-----------|
-| Agent can't do forbidden things | REJECT level hard-coded, cannot override |
-| Agent can't exceed scope | Sandbox isolation (FS, network, process limits) |
-| Every action is traceable | Event Store append-only log |
-| Decisions can't be tampered with | Hash chain on Decision Records |
-| Authorization is context-scoped | Context binding checks before every confirmed action |
-| Timeouts don't silently fail | Smart timeout with AI judgment |
-| All confirmations preserved | Multi-channel delivery, all records immutable |
+| Agent 不能做禁止的操作 | REJECT 级别硬编码，不可绕过 |
+| Agent 不能越界 | 沙箱隔离（文件系统、网络、进程限制） |
+| 所有操作可追踪 | Event Store append-only 日志 |
+| 决策不可篡改 | Decision Record hash 链 |
+| 授权受上下文限定 | 每次已确认操作前做上下文绑定检查 |
+| 超时不静默失败 | 智能超时 + AI 判断 |
+| 所有确认记录保留 | 多渠道送达，全部不可变记录 |
 
 ---
 
-## Technology Stack
+## 技术栈
 
-| Layer | Technology | Rationale |
+| 层 | 技术 | 选型理由 |
 |-------|-----------|-----------|
-| **Backend** | Python (FastAPI) | AI/LLM ecosystem, rapid development |
-| **Event Store** | SQLite → PostgreSQL | Simple start, production-ready upgrade |
-| **Frontend** | React + Tailwind | Lightweight SPA |
-| **Real-time** | WebSocket | Live Dashboard updates |
-| **IM** | 企业微信 Bot API | Target initial platform |
-| **LLM Providers** | Anthropic, OpenAI, DeepSeek | Multi-model support |
-| **Sandbox** | Docker / subprocess+chroot | Isolation |
-| **Vector DB (future)** | Pinecone / pgvector | Semantic search |
+| **后端** | Python（FastAPI） | AI/LLM 生态最强，快速开发 |
+| **Event Store** | SQLite → PostgreSQL | 初期简单，无缝升级到生产 |
+| **前端** | React + Tailwind | 轻量 SPA |
+| **实时通信** | WebSocket | Dashboard 实时更新 |
+| **IM** | 企业微信 Bot API | 初始目标平台 |
+| **LLM Providers** | Anthropic、OpenAI、DeepSeek | 多模型支持 |
+| **沙箱** | Docker / subprocess+chroot | 进程隔离 |
+| **向量数据库（未来）** | Pinecone / pgvector | 语义搜索 |
 
 ---
 
-## Implementation Phases (High-Level)
+## 实施阶段（概要）
 
-| Phase | Focus |
+| 阶段 | 重点 |
 |-------|-------|
-| **Phase 1: Core Agent** | Agent singleton, basic harness (file+shell+git), single-model, CLI interface |
-| **Phase 2: IM Integration** | WeCom adapter, message pipeline, simple confirmation flow |
-| **Phase 3: Task System** | Task decomposition, sub-agent pool, Project Brain Event Store |
-| **Phase 4: Dashboard** | Web UI, live feed, task map, decision log |
-| **Phase 5: Multi-Model** | Provider adapters, capability registry, model router |
-| **Phase 6: Advanced** | Discussion threads, context binding, smart timeout, AI-learned profiles |
+| **Phase 1: Core Agent** | Agent 单例、基础 harness（文件+shell+git）、单模型、CLI 界面 |
+| **Phase 2: IM 接入** | 企业微信 Adapter、消息流水线、简单确认流程 |
+| **Phase 3: 任务系统** | 任务拆解、sub-agent 池、Project Brain Event Store |
+| **Phase 4: Dashboard** | Web 界面、实时动态流、任务地图、决策日志 |
+| **Phase 5: 多模型** | Provider Adapter、能力注册中心、Model Router |
+| **Phase 6: 高级特性** | Discussion Thread、上下文绑定、智能超时、AI 自学习 Profile |
