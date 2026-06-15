@@ -86,6 +86,26 @@ IM 消息进入 → 身份识别 → 意图解析 → （查询类/执行类）
                             广播通知
 ```
 
+### Sub-Agent 模型
+
+Sub-agent 是主 Agent 为并行执行原子任务而派生的**轻量级执行实例**。
+
+| 属性 | 主 Agent | Sub-Agent |
+|------|---------|-----------|
+| **职责** | 拆解任务、路由决策、维护全局上下文 | 执行单个原子任务 |
+| **生命周期** | 项目级别，持久运行 | 任务级别，执行完即销毁 |
+| **上下文** | 完整项目上下文 + 对话历史 | 只含该原子任务相关的精简上下文 |
+| **决策权** | 有（拆解、升级、确认） | 无（只执行，不确定时回传主 Agent） |
+| **并发数** | 1 个 | 最多 5 个同时运行 |
+| **工具权限** | 受完整 Harness 约束 | 继承主 Agent 的权限配置 |
+| **故障处理** | Watchdog 恢复 | 挂了就挂了，主 Agent 重试或重分配 |
+
+Sub-agent 的关键约束：
+- **只执行，不决策** — 遇到任何不确定，回传主 Agent，不自行判断
+- **上下文隔离** — sub-agent 不知道其他 sub-agent 在做什么，避免相互干扰
+- **操作幂等** — 主 Agent 重试失败的 sub-agent 时，操作必须是幂等的
+- **结果回传** — 执行完成后，结果（代码变更、工具输出）回传给主 Agent，由主 Agent 合并
+
 ### 决策升级 — Discussion Thread（讨论线程）
 
 当 Agent 不确定时，在 IM 渠道中创建 **Discussion Thread**：
@@ -343,7 +363,7 @@ DecisionRecord:
   id, request_id
   type: [git_commit|file_write|shell_exec|architecture|…]
   summary, context: {task_id, files, diff_hash, risk_level}
-  decided_by: contact_id | "ai_review"
+  decided_by: contact_id | "safety_model"
   channel: [wecom|dashboard|…]
   decision: [approved|rejected|expired]
   decided_at, comment
@@ -378,13 +398,26 @@ DecisionRecord:
 
 ### 智能超时
 
-超时不等于粗暴拒绝，而是走 AI 判断：
-1. AI 判断：上下文还干净吗？风险低吗？
-2. 上下文干净 + 低风险 → AI 确认继续（记录在案）
-3. 上下文变了 → 重新生成确认请求
+超时策略按权限等级分别处理：
+
+**AUTO / AUTO+ 级别超时**（Safety Model 审查的操作）：
+1. Safety Model 重新评估：上下文还干净吗？风险低吗？
+2. 上下文干净 + 低风险 → Safety Model 确认继续（记录在案）
+3. 上下文变了 → 重新生成确认请求，走完整审查链
 4. 高风险或不确定 → @提醒 + 重置 TTL
 
-此机制对 AI_REVIEW 和 CONFIRM 级别同等适用。
+**CONFIRM 级别超时**（必须人工确认的操作）：
+1. AI **不能**自行推进——CONFIRM 的存在意义就是人的判断不可替代
+2. 超时后 @提醒相关人 + 重置 TTL（再等 30 分钟）
+3. 连续超时 3 次 → 升级到更高决策权的人
+4. 记录超时事件到 Decision Log（审计用）
+
+| 超时后的行为 | AUTO/AUTO+ | CONFIRM |
+|------------|-----------|---------|
+| Safety Model 重新审查 | ✅ | ❌（不经过 Safety Model） |
+| AI 可自行推进 | ✅（低风险且上下文干净） | ❌（必须等人） |
+| @提醒 + 重置 TTL | ✅（高风险/不确定） | ✅（每次超时） |
+| 连续超时升级 | ✅ | ✅（升级决策链） |
 
 ---
 
@@ -659,7 +692,7 @@ Tool Harness
          │                  ├── MCP Server C: 知识库搜索
          │                  └── MCP Server D: …
          │
-    ── 所有工具统一走权限门禁（AUTO/AI_REVIEW/CONFIRM/REJECT）
+    ── 所有工具统一走权限门禁（AUTO/AUTO+/CONFIRM/REJECT）
 ```
 
 ### MCP Client 职责
@@ -710,8 +743,8 @@ mcp:
   # MCP 工具的权限映射
   tool_permissions:
     "codegraph.*": auto            # codegraph 的工具全自动
-    "playwright.browser_navigate": ai_review
-    "playwright.browser_click": ai_review
+    "playwright.browser_navigate": auto_plus
+    "playwright.browser_click": auto_plus
     "knowledge-base.*": auto
 ```
 
@@ -829,7 +862,7 @@ class SkillRegistry:
 - Skill 本身可以声明安全约束（如 TDD skill 要求"必须先写测试"）
 - Skill 不能绕过权限门禁——它定义的流程仍然受 Harness 4 层模型约束
 - Skill 中可以引用 MCP 工具——两者无缝组合
-- 示例：一个"数据库迁移"Skill 通过 MCP 连接数据库，但 write 操作仍走 AI_REVIEW
+- 示例：一个"数据库迁移"Skill 通过 MCP 连接数据库，但 write 操作仍走 AUTO+（Safety Model 审查）
 
 ---
 
@@ -892,14 +925,14 @@ cost:
 
 ### 策略二：Context 瘦身 — 不喂多余的东西
 
-Context 是 token 消耗的大头。Context Manager 的压缩策略（Section 12）直接决定成本：
+Context 是 token 消耗的大头。压缩策略详见 **Section 12（Context Manager — 分层压缩策略）**，此处只做成本视角补充：
 
-| 压缩动作 | 省多少 | 代价 |
+| 压缩动作 | 省多少 | 成本收益分析 |
 |---------|--------|------|
-| 裁剪已完成的 tool 调用结果 | ~30% | 丢失执行细节（通常可接受） |
-| 对话历史摘要（FAST Tier 做） | ~80% | 摘要可能丢失微妙上下文 |
-| 截断长输出（shell/diff） | ~20% | 丢失完整输出（保留头尾） |
-| 代码文件只传 diff 不传全量 | ~50% | 需要 Agent 知道上下文 |
+| 裁剪已完成的 tool 调用结果 | ~30% | 低成本高收益，默认开启 |
+| 对话历史摘要（FAST Tier 做） | ~80% | 摘要本身消耗少量 token，净收益高 |
+| 截断长输出（shell/diff） | ~20% | 零成本（纯文本截断） |
+| 代码文件只传 diff 不传全量 | ~50% | 需要 Agent 理解 diff 上下文 |
 
 **Context 瘦身优先级**：BRAIN > WORKER > FAST。贵模型的上下文瘦身要更激进。
 
@@ -1030,12 +1063,14 @@ Dashboard 实时展示：
 
 ## 实施阶段（概要）
 
-| 阶段 | 重点 |
-|-------|-------|
-| **Phase 1: Core Agent** | Agent 单例、基础 harness（文件+shell+git）、单模型、CLI 界面 |
-| **Phase 2: IM 接入** | 企业微信 Adapter、消息流水线、简单确认流程 |
-| **Phase 3: 任务系统** | 任务拆解、sub-agent 池、Project Brain Event Store |
-| **Phase 4: Dashboard** | Web 界面、实时动态流、任务地图、决策日志 |
-| **Phase 5: 多模型** | Provider Adapter、能力注册中心、Model Router、Context Manager |
-| **Phase 6: 扩展机制** | MCP Client、Skill Registry、Skill 匹配和执行 |
-| **Phase 7: 高级特性** | Discussion Thread、上下文绑定、智能超时、AI 自学习 Profile |
+实施顺序已按依赖关系排列。每阶段的"前置依赖"列说明了为什么必须先做前面的。
+
+| 阶段 | 重点 | 前置依赖 |
+|-------|-------|---------|
+| **Phase 1: Core Agent** | Agent 单例、基础 harness（文件+shell+git）、单模型、CLI 界面、最小 Event Store（SQLite，只为 agent 状态持久化和 failover） | 无 |
+| **Phase 2: IM 接入** | 企业微信 Adapter、消息流水线、简单确认流程 | Phase 1（需要 Agent 能执行才能回复 IM） |
+| **Phase 3: 任务系统** | 任务拆解、sub-agent 池、完整 Project Brain（Event Store → Task Graph + Decision Log + Code History 视图） | Phase 1（Event Store 基础在 Phase 1 已建） |
+| **Phase 4: Dashboard** | Web 界面、实时动态流、任务地图、决策日志 | Phase 3（Dashboard 展示的是 Project Brain 的数据） |
+| **Phase 5: 多模型** | Provider Adapter、能力注册中心、Model Router、Context Manager | Phase 1（需要 Agent 框架来接入多模型） |
+| **Phase 6: 扩展机制** | MCP Client、Skill Registry、Skill 匹配和执行、Safety Model 独立实例 | Phase 5（MCP/Skill 需要多模型路由能力） |
+| **Phase 7: 高级特性** | Discussion Thread、上下文绑定、智能超时、AI 自学习 Profile | Phase 2+3（Discussion 需要 IM 和任务基础） |
