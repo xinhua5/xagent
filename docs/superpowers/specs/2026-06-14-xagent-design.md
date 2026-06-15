@@ -1,6 +1,6 @@
 # xagent — AI 原生的软件工程协作平台
 
-> **设计文档** | 2026-06-14 | Version 1.0
+> **设计文档** | 2026-06-15 | Version 1.1
 
 ---
 
@@ -509,6 +509,364 @@ class ContextManager:
 
 ---
 
+## Section 13: MCP（Model Context Protocol）— 标准化工具接入
+
+### 为什么需要 MCP
+
+MCP 是一个开放协议，标准化了 AI Agent 与外部工具、数据源之间的通信方式。通过 MCP，xagent 可以接入任何兼容 MCP 的服务——数据库查询、浏览器自动化、知识库搜索、第三方 API 等——而不需要为每个服务写定制代码。
+
+### 架构
+
+```
+Agent Core
+    │
+    ▼
+Tool Harness
+    │
+    ├── Built-in Tools（内置工具）: file_read, shell_exec, git_*, …
+    ├── Plugin Tools（插件工具）: browser, docker, …
+    └── MCP Client ──── MCP Servers（外部工具）
+         │                  ├── MCP Server A: 数据库查询
+         │                  ├── MCP Server B: 浏览器自动化
+         │                  ├── MCP Server C: 知识库搜索
+         │                  └── MCP Server D: …
+         │
+    ── 所有工具统一走权限门禁（AUTO/AI_REVIEW/CONFIRM/REJECT）
+```
+
+### MCP Client 职责
+
+```python
+class MCPClient:
+    """管理与 MCP Server 的连接和工具发现"""
+
+    def connect(server_config) → MCPConnection
+        """建立与 MCP Server 的连接（stdio / SSE / streamable HTTP）"""
+
+    def list_tools(connection) → list[ToolDef]
+        """发现该 Server 提供的所有工具"""
+
+    def list_resources(connection) → list[ResourceDef]
+        """发现该 Server 提供的资源（文件、数据等）"""
+
+    def call_tool(connection, tool_name, args) → ToolResult
+        """调用工具，经过权限门禁"""
+
+    def health_check(connection) → bool
+        """检查连接是否存活"""
+```
+
+### 配置方式
+
+```yaml
+# xagent.yaml — MCP 配置
+mcp:
+  servers:
+    - name: "codegraph"
+      command: "codegraph"
+      args: ["--stdio"]
+      env: {}
+      auto_connect: true           # Agent 启动时自动连接
+
+    - name: "playwright"
+      command: "npx"
+      args: ["-y", "@anthropic/mcp-playwright"]
+      auto_connect: false          # 需要时再连接
+
+    - name: "knowledge-base"
+      url: "https://kb.internal.com/mcp"
+      transport: "sse"
+      headers:
+        Authorization: "Bearer ${KB_TOKEN}"
+
+  # MCP 工具的权限映射
+  tool_permissions:
+    "codegraph.*": auto            # codegraph 的工具全自动
+    "playwright.browser_navigate": ai_review
+    "playwright.browser_click": ai_review
+    "knowledge-base.*": auto
+```
+
+### MCP 工具的安全边界
+
+- MCP 工具与内置工具走**同一套权限门禁**（4 级模型）
+- 每个 MCP Server 的工具可以单独配置权限级别
+- MCP Server 的进程在**沙箱内运行**（受 L3 沙箱隔离约束）
+- 工具调用记录到 Event Store，与内置工具无差别审计
+
+---
+
+## Section 14: Skill System（技能系统）— Agent 行为扩展
+
+### 为什么需要 Skill
+
+Skill 是封装了特定领域知识、工作流程和最佳实践的可复用模块。它不是"工具"（工具是 Agent 调用的外部能力），而是"方法论"——告诉 Agent **怎么做某类事情**。例如：
+
+- **test-driven-development**：教 Agent 先写测试再写代码的完整流程
+- **systematic-debugging**：教 Agent 如何系统性地排查 bug
+- **frontend-design**：教 Agent 如何创建高质量的 UI
+- **code-review**：教 Agent 如何审查代码
+
+### Skill 在 xagent 中的位置
+
+```
+Agent Core
+    │
+    ├── System Prompt（系统提示词）
+    ├── Skill Registry（技能注册中心）
+    │     ├── Project Skills（项目级）
+    │     ├── User Skills（用户级）
+    │     └── System Skills（系统级）
+    │
+    └── Skill × Tier 映射
+           ├── 复杂 Skill（TDD、架构设计）→ BRAIN Tier
+           ├── 执行 Skill（代码生成、测试）→ WORKER Tier
+           └── 轻量 Skill（格式检查、摘要）→ FAST Tier
+```
+
+### Skill 数据模型
+
+```yaml
+Skill:
+  name: "test-driven-development"
+  description: "编写代码前先写测试，红-绿-重构循环"
+  trigger_keywords: ["测试", "tdd", "单元测试", "test"]
+  tier: "worker"               # 默认用哪个 Tier 的模型执行
+
+  # 技能内容（类 markdown，含指令和工作流）
+  body: |
+    ## TDD 开发流程
+    1. 先写一个失败的测试
+    2. 写最少代码让测试通过
+    3. 重构代码
+    ...
+
+  # 可选：技能需要的额外工具
+  required_tools: ["file_read", "file_write", "shell_exec", "test_run"]
+
+  # 可选：技能的安全约束
+  safety: {
+    max_files_per_cycle: 3,
+    require_test_before_code: true
+  }
+
+  # 来源
+  source: "project"             # project | user | system
+  enabled: true
+```
+
+### Skill 生命周期
+
+```
+1. 加载 ── Agent 启动时从 Registry 加载所有已启用的 Skill
+2. 匹配 ── 收到任务后，根据关键词/任务类型匹配相关 Skill
+3. 激活 ── 匹配到的 Skill 内容注入 Agent 的 system prompt
+4. 执行 ── Agent 按照 Skill 定义的工作流执行
+5. 反馈 ── Skill 执行效果记录到 Event Store（可选）
+```
+
+### Skill 与 Tier 的协同
+
+不同的 Skill 对模型能力要求不同，Skill 注册时声明自己需要哪一层 Tier：
+
+| Skill 类型 | 推荐 Tier | 示例 |
+|-----------|----------|------|
+| 架构/设计类 | BRAIN | 系统架构设计、技术选型 |
+| 开发/测试类 | WORKER | TDD、代码重构、API 开发 |
+| 检查/摘要类 | FAST | 代码格式检查、变更摘要 |
+
+如果当前可用的 WORKER Tier 模型不支持 tool_use，Agent 会将该 Skill 升级到 BRAIN Tier 的模型执行。
+
+### Skill 注册中心
+
+```python
+class SkillRegistry:
+    """管理所有 Skill 的加载和匹配"""
+
+    def load_from_path(path) → None
+        """从目录加载 Skill 文件（.md / .yaml）"""
+
+    def match(task_description: str) → list[Skill]
+        """根据任务描述匹配相关 Skill"""
+
+    def get_skill_prompt(skill: Skill) → str
+        """获取 Skill 的指令文本，用于注入 system prompt"""
+
+    def list_all() → list[Skill]
+        """列出所有已注册 Skill"""
+```
+
+### 与 Harness 安全模型的协同
+
+- Skill 本身可以声明安全约束（如 TDD skill 要求"必须先写测试"）
+- Skill 不能绕过权限门禁——它定义的流程仍然受 Harness 4 层模型约束
+- Skill 中可以引用 MCP 工具——两者无缝组合
+- 示例：一个"数据库迁移"Skill 通过 MCP 连接数据库，但 write 操作仍走 AI_REVIEW
+
+---
+
+## Section 15: Token Cost Management（Token 成本管控）
+
+> AI native 平台最大的隐性成本是 token 消耗。xagent 必须在设计层面就内置成本管控，而不是事后补救。
+
+### 成本分层模型
+
+```
+                    ┌─────────────────────┐
+  高成本           │  BRAIN Tier          │  ← 只在真正需要时用
+  (谨慎使用)        │  Opus / GPT-5        │
+                    ├─────────────────────┤
+  中成本           │  WORKER Tier         │  ← 主力，但要优化
+  (主力优化)        │  Sonnet / DeepSeek    │
+                    ├─────────────────────┤
+  低成本           │  FAST Tier           │  ← 能用的地方尽量用
+  (优先使用)        │  Haiku / GPT-4o-mini  │
+                    └─────────────────────┘
+```
+
+### 策略一：Tier 降级 — 能用便宜的绝不用贵的
+
+Agent 每次调用 LLM 前，走降级判断：
+
+```
+需要 BRAIN？
+  ├─ 真的是架构决策/冲突调解？ → 用 BRAIN
+  ├─ 其实 WORKER 也能做？ → 降级到 WORKER
+  └─ 只是简单判断？ → 降级到 FAST
+
+需要 WORKER？
+  ├─ 真的需要生成/修改代码？ → 用 WORKER
+  └─ 只是格式检查/摘要？ → 降级到 FAST
+```
+
+**降级规则配置**：
+
+```yaml
+# xagent.yaml
+cost:
+  tier_downgrade:
+    # 某些 task_type 可以降级
+    task_type_overrides:
+      "simple_query": fast       # 简单查询直接用 FAST
+      "status_check": fast       # 状态检查直接用 FAST
+      "message_summary": fast    # 消息摘要直接用 FAST
+      "intent_parse": fast       # 意图解析直接用 FAST
+
+    # BRAIN Tier 的降级条件
+    brain_downgrade_if:
+      - task_is_routine          # 常规任务不需要 BRAIN
+      - confidence_high          # 高置信度不需要 BRAIN
+      - single_file_scope        # 单文件范围不需要 BRAIN
+
+  # BRAIN Tier 每日配额（超过后必须人工确认）
+  brain_daily_limit: 20
+```
+
+### 策略二：Context 瘦身 — 不喂多余的东西
+
+Context 是 token 消耗的大头。Context Manager 的压缩策略（Section 12）直接决定成本：
+
+| 压缩动作 | 省多少 | 代价 |
+|---------|--------|------|
+| 裁剪已完成的 tool 调用结果 | ~30% | 丢失执行细节（通常可接受） |
+| 对话历史摘要（FAST Tier 做） | ~80% | 摘要可能丢失微妙上下文 |
+| 截断长输出（shell/diff） | ~20% | 丢失完整输出（保留头尾） |
+| 代码文件只传 diff 不传全量 | ~50% | 需要 Agent 知道上下文 |
+
+**Context 瘦身优先级**：BRAIN > WORKER > FAST。贵模型的上下文瘦身要更激进。
+
+### 策略三：Cache 利用 — 同样的话不说第二遍
+
+不同模型的 cache 机制不同，Context Manager 针对性优化：
+
+| 模型 | Cache 机制 | 优化策略 |
+|------|-----------|---------|
+| Claude | 手动标记 breakpoints，5min TTL | System prompt + 工具定义放前 4 个 breakpoint |
+| OpenAI | 自动缓存 | 不变的前缀尽量大块（>1024 tokens） |
+| DeepSeek | 磁盘 KV-cache | 相同 system prompt 复用 cache |
+
+**Cache 命中率目标**：>80%（即 80% 的输入 token 不重复计费）。
+
+### 策略四：Token 预算 — 任务级别的硬限制
+
+```yaml
+# xagent.yaml
+cost:
+  budgets:
+    per_task: 50000            # 单个原子任务最多 5 万 token
+    per_feature: 500000        # 单个 Feature 最多 50 万 token
+    per_day: 5000000           # 每天最多 500 万 token
+    per_brain_call: 20000      # BRAIN 单次调用最多 2 万 token
+
+  # 超预算行为
+  on_budget_exceeded:
+    per_task: pause_and_confirm    # 暂停，人工确认是否继续
+    per_feature: warn_and_downgrade # 告警，后续任务强制降级到 FAST
+    per_day: hard_stop              # 硬停止，等第二天
+```
+
+### 策略五：智能重试 — 失败不重复烧钱
+
+```
+操作失败
+  ├─ 网络/超时错误 → 重试（不消耗额外 token 思考）
+  ├─ 模型输出格式错误 → 最多重试 2 次
+  │   第 1 次：原模型修复
+  │   第 2 次：降级到 FAST 修复（便宜）
+  │   第 3 次：人工介入（不烧 token）
+  └─ 逻辑错误 → 不重试，记录并继续
+```
+
+**关键原则**：不要让昂贵的 BRAIN Tier 模型做"格式修正"这种低级工作。
+
+### 策略六：成本可视化
+
+Dashboard 实时展示：
+
+```
+┌─────────────────────────────────────────────┐
+│  💰 Token 消耗                              │
+│                                              │
+│  今日: 234,567 tokens  ≈ ¥3.52              │
+│  本周: 1,234,567 tokens  ≈ ¥18.50           │
+│  本月: 5,234,567 tokens  ≈ ¥78.50           │
+│                                              │
+│  ████████░░ BRAIN  45% (¥35.33)             │
+│  ██████░░░░ WORKER 35% (¥27.48)             │
+│  ██░░░░░░░░ FAST   20% (¥15.70)             │
+│                                              │
+│  Feature "用户登录": 456,789 tokens (¥6.85)  │
+│  最贵操作: task_042 架构决策 (¥0.52)         │
+└─────────────────────────────────────────────┘
+```
+
+### 成本优化决策树（Agent 每次调用前执行）
+
+```
+要调 LLM 了
+  │
+  ├─ 可以用 cache 吗？ → 用，省 ~90%
+  ├─ 可以降级 Tier 吗？ → 降，省 ~80%
+  ├─ context 可以再压吗？ → 压，省 ~30%
+  ├─ 这次调用真有必要吗？
+  │   ├─ 只是格式转换？ → 不调 LLM，用代码
+  │   ├─ 只是模板填充？ → 不调 LLM，用模板
+  │   └─ 确实需要 LLM → 调吧
+  └─ 调完之后 → 记录消耗，更新预算
+```
+
+### 成本效率指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| FAST Tier 使用占比 | >60% | 大部分调用用便宜模型 |
+| Cache 命中率 | >80% | 减少重复计费 |
+| BRAIN 调用/天 | <20 | 严格控制最贵模型的使用 |
+| 每次原子任务平均 token | <10,000 | 任务粒度与成本匹配 |
+| 重试率 | <5% | 一次做对，不反复烧钱 |
+
+---
+
 ## 安全总览
 
 | 安全关切 | 保障机制 |
@@ -546,5 +904,6 @@ class ContextManager:
 | **Phase 2: IM 接入** | 企业微信 Adapter、消息流水线、简单确认流程 |
 | **Phase 3: 任务系统** | 任务拆解、sub-agent 池、Project Brain Event Store |
 | **Phase 4: Dashboard** | Web 界面、实时动态流、任务地图、决策日志 |
-| **Phase 5: 多模型** | Provider Adapter、能力注册中心、Model Router |
-| **Phase 6: 高级特性** | Discussion Thread、上下文绑定、智能超时、AI 自学习 Profile |
+| **Phase 5: 多模型** | Provider Adapter、能力注册中心、Model Router、Context Manager |
+| **Phase 6: 扩展机制** | MCP Client、Skill Registry、Skill 匹配和执行 |
+| **Phase 7: 高级特性** | Discussion Thread、上下文绑定、智能超时、AI 自学习 Profile |
