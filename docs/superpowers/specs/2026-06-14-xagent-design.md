@@ -157,23 +157,150 @@ Task:
 
 ---
 
-## Section 4: Harness 安全 — 四层模型
+## Section 4: Harness 安全 — 五层模型 + Safety Model
+
+核心理念：**"干活的 Agent"和"审查安全的 Agent"必须是两个不同的脑子**。
+
+### 安全架构全景
+
+```
+Agent（干活）要执行操作
+       │
+       ▼
+┌──────────────────────────────────────────┐
+│ L1: 能力边界                              │
+│     没注册的能力根本不存在                  │
+└──────────────┬───────────────────────────┘
+               │ 操作已注册
+               ▼
+┌──────────────────────────────────────────┐
+│ L2: 权限分级                              │
+│     AUTO ──→ Safety Model 自动审查        │
+│     CONFIRM → 人工确认                     │
+│     REJECT ──→ 硬拒绝                      │
+└──────────────┬───────────────────────────┘
+               │
+          ┌────┴────┐
+          │         │
+      AUTO/SM   CONFIRM
+          │         │
+          ▼         ▼
+┌─────────────┐ ┌─────────────┐
+│ L2.5        │ │ 人工确认     │
+│ Safety      │ │ 多渠道推送   │
+│ Model       │ │ 决策记录     │
+│ 安全审查     │ └─────────────┘
+│             │
+│ 批准/拒绝    │
+│ /升级人工    │
+└──────┬──────┘
+       │ 批准
+       ▼
+┌──────────────────────────────────────────┐
+│ L3: 沙箱隔离                              │
+│     文件系统、网络、进程全限制              │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ L4: 审计追踪                              │
+│     Event Store 全记录                    │
+└──────────────────────────────────────────┘
+```
 
 ### 第一层：能力边界（Capability Boundary）
+
 Agent 只能调用已注册的工具。未注册的能力根本不存在。
 
 **默认工具**：`file_read`、`file_write`、`shell_exec`、`git_*`、`web_fetch`、`lsp_query`
-**可插件扩展**：`browser`、`db_query`、`docker`、…
+**可插件扩展**：MCP Server 提供的工具、Skill 引入的工具
 **硬编码禁止**：`file_delete`（默认）、`network_bind`、`sudo`
 
-### 第二层：权限门禁（Permission Gate）
+### 第二层：权限分级 — 三级简化模型
 
-| 级别 | 行为 | 示例 |
-|-------|----------|---------|
-| 🟢 **AUTO（自动）** | 直接执行，事后记录 | file_read、git log、test_run |
-| 🟡 **AI_REVIEW（AI 自查）** | AI 先自检；安全则自动；不确定则升级 | file_write、shell_exec、git_commit |
-| 🔴 **CONFIRM（人工确认）** | 必须问人 | pip_install、config_change |
-| ⛔ **REJECT（硬禁止）** | 硬编码拒绝，不可绕过 | file_delete、git_push --force |
+| 级别 | 行为 | 谁审查 | 示例 |
+|-------|------|--------|---------|
+| 🟢 **AUTO** | Safety Model 自动审查，通过即执行 | Safety Model | file_read、git_log、test_run、web_fetch |
+| 🟡 **AUTO+** | Safety Model 审查，高风险时升级人工 | Safety Model → 人工 | file_write、shell_exec、git_commit |
+| 🔴 **CONFIRM** | 跳过 Safety Model，必须人工确认 | 直接人工 | pip_install、config_change、git_push |
+| ⛔ **REJECT** | 硬编码拒绝，不可绕过 | 无（绝对禁止） | file_delete、rm -rf、force push |
+
+> 不再有 AI_REVIEW 的概念——所有 AI 级别的审查都由 Safety Model 统一负责。
+> AUTO 和 AUTO+ 的区别仅在于：AUTO+ 的操作如果 Safety Model 不确定，会升级到人工；AUTO 的操作 Safety Model 不确定时直接拒绝（因为这类操作默认就应该安全）。
+
+### 第二点五层：Safety Model（安全审查模型）
+
+```
+Agent 要执行操作
+       │
+       ▼
+┌──────────────────────────────────────────┐
+│         SAFETY MODEL                      │
+│                                           │
+│  独立的、专注于安全的 LLM 实例             │
+│  可能是一个专门的模型（如 fine-tuned）      │
+│  初期用 BRAIN Tier + 安全专用 system prompt│
+│                                           │
+│  输入:                                     │
+│  • 操作类型 + 参数                         │
+│  • 上下文快照（文件、任务、影响范围）        │
+│  • 历史同类操作的审查结果                   │
+│                                           │
+│  输出:                                     │
+│  • APPROVE  → 执行                         │
+│  • DENY     → 拒绝（记录原因）              │
+│  • ESCALATE → 升级到人工确认               │
+└──────────────────────────────────────────┘
+```
+
+**Safety Model 的设计原则**：
+
+| 原则 | 说明 |
+|------|------|
+| **独立实例** | 与干活 Agent 使用不同的 LLM 上下文，不共享对话历史 |
+| **只读视角** | Safety Model 只做审查，永远不调用工具、不修改代码 |
+| **专注安全** | system prompt 只包含安全规则，不包含执行逻辑 |
+| **快速判定** | 输入精简（操作+上下文快照），期望 <2s 响应 |
+| **可审计** | 每次审查结果写入 Decision Log，与人工决策同等待遇 |
+
+**Safety Model 的审查 Prompt 结构**：
+
+```
+你是 xagent 安全审查引擎。你的唯一职责是判断操作是否安全。
+
+安全规则：
+1. 操作范围是否在项目目录内？
+2. 是否涉及敏感信息（密码、token、密钥）？
+3. 是否可能造成不可逆破坏（删除、覆写关键配置）？
+4. 操作参数是否与任务描述一致？
+5. 是否违反项目的安全策略（xagent.yaml）？
+
+请审查以下操作：
+- 操作: git_commit
+- 参数: message="add auth module", files=["auth.py","models.py"]
+- 上下文: task_042, Feature "数据库模型", 改动 +142 -0
+- 风险等级: low
+
+回答格式: { decision: APPROVE | DENY | ESCALATE, reason: "..." }
+```
+
+**Safety Model 与权限等级的映射**：
+
+| 操作权限等级 | Safety Model 行为 |
+|-------------|------------------|
+| AUTO | Safety Model 审查 → APPROVE 执行 / DENY 拒绝 / ESCALATE 升级人工 |
+| AUTO+ | 同上，但 ESCALATE 阈值更低（更容易升级） |
+| CONFIRM | **绕过 Safety Model**，直接走人工确认 |
+| REJECT | **不经过任何审查**，直接拒绝 |
+
+**为什么要分离 Safety Model？**
+
+| 分离的好处 | 如果不分离 |
+|-----------|----------|
+| 干活 Agent 和审查 Agent 利益冲突隔离 | Agent 可能给自己放水 |
+| 安全 prompt 不与任务 prompt 混合 | 不会因为任务太长、安全规则被"挤掉" |
+| 可以用更便宜的模型做审查（输入少） | 审查跟着任务上下文，成本高 |
+| 审查结果独立审计 | 自己审自己，审计意义打折 |
 
 ### 第三层：沙箱隔离（Sandbox Isolation）
 
@@ -188,10 +315,11 @@ Agent 只能调用已注册的工具。未注册的能力根本不存在。
 每次工具调用记录到 Event Store：
 ```yaml
 {tool, input, output, duration, permission_level,
- auto_approved, sandbox_id, files_touched, snapshot_diff}
+ safety_model_decision, safety_model_reason,
+ sandbox_id, files_touched, snapshot_diff}
 ```
 
-### 回滚机制
+### 第五层：回滚机制
 
 - **Git 级（粗粒度）**：Feature 开始前自动 git stash，需要时 reset
 - **Overlay 级（细粒度）**：每个原子任务的 overlay delta；失败时丢弃该 delta，不影响并行的其他任务
@@ -831,9 +959,10 @@ Dashboard 实时展示：
 │  本周: 1,234,567 tokens  ≈ ¥18.50           │
 │  本月: 5,234,567 tokens  ≈ ¥78.50           │
 │                                              │
-│  ████████░░ BRAIN  45% (¥35.33)             │
-│  ██████░░░░ WORKER 35% (¥27.48)             │
-│  ██░░░░░░░░ FAST   20% (¥15.70)             │
+│  ██████░░░░ BRAIN (任务)  30% (¥23.55)       │
+│  ███░░░░░░░ BRAIN (安全)  15% (¥11.78)  ← Safety Model│
+│  ██████░░░░ WORKER        35% (¥27.48)       │
+│  ████░░░░░░ FAST          20% (¥15.70)       │
 │                                              │
 │  Feature "用户登录": 456,789 tokens (¥6.85)  │
 │  最贵操作: task_042 架构决策 (¥0.52)         │
@@ -861,8 +990,9 @@ Dashboard 实时展示：
 |------|--------|------|
 | FAST Tier 使用占比 | >60% | 大部分调用用便宜模型 |
 | Cache 命中率 | >80% | 减少重复计费 |
-| BRAIN 调用/天 | <20 | 严格控制最贵模型的使用 |
-| 每次原子任务平均 token | <10,000 | 任务粒度与成本匹配 |
+| BRAIN 调用/天（含 Safety Model） | <50 | 其中 Safety Model <30, 任务决策 <20 |
+| Safety Model 单次审查 | <3,000 tokens | 精简输入，不含任务上下文 |
+| 每次原子任务平均 token（含审查） | <15,000 | 任务 10K + Safety 审查 3K + 开销 |
 | 重试率 | <5% | 一次做对，不反复烧钱 |
 
 ---
@@ -872,9 +1002,11 @@ Dashboard 实时展示：
 | 安全关切 | 保障机制 |
 |---------|-----------|
 | Agent 不能做禁止的操作 | REJECT 级别硬编码，不可绕过 |
+| Agent 不能自我审查 | Safety Model 独立实例审查所有 AUTO 操作 |
+| Safety Model 不被任务上下文干扰 | 审查用精简输入，独立 system prompt |
 | Agent 不能越界 | 沙箱隔离（文件系统、网络、进程限制） |
 | 所有操作可追踪 | Event Store append-only 日志 |
-| 决策不可篡改 | Decision Record hash 链 |
+| 决策不可篡改 | Decision Record hash 链（含 Safety Model 审查记录） |
 | 授权受上下文限定 | 每次已确认操作前做上下文绑定检查 |
 | 超时不静默失败 | 智能超时 + AI 判断 |
 | 所有确认记录保留 | 多渠道送达，全部不可变记录 |
